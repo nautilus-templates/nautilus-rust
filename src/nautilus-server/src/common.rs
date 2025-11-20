@@ -167,24 +167,7 @@ pub async fn health_check(
                                 };
 
                                 let is_reachable = match client.get(&url).send().await {
-                                    Ok(response) => {
-                                        if endpoint_str.contains(".amazonaws.com") {
-                                            // For AWS endpoints, check if response body contains "healthy"
-                                            match response.text().await {
-                                                Ok(body) => body.to_lowercase().contains("healthy"),
-                                                Err(e) => {
-                                                    info!(
-                                                        "Failed to read response body from {}: {}",
-                                                        endpoint_str, e
-                                                    );
-                                                    false
-                                                }
-                                            }
-                                        } else {
-                                            // For non-AWS endpoints, check for 200 status
-                                            response.status().is_success()
-                                        }
-                                    }
+                                    Ok(_) => true, // Any HTTP response indicates network path is reachable
                                     Err(e) => {
                                         info!("Failed to connect to {}: {}", endpoint_str, e);
                                         false

@@ -3,6 +3,15 @@
 #!/bin/bash
 # configure_enclave.sh
 
+load_env_file() {
+  ENV_FILE=".env"
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+  fi
+}
+
 # Additional information on this script. 
 show_help() {
     echo "configure_enclave.sh - Launch AWS EC2 instance with Nitro Enclaves and configure allowed endpoints. "
@@ -24,10 +33,14 @@ show_help() {
     echo "  # optional: export REGION=<your-region>  (defaults to us-east-1)"
     echo "  # optional: export AMI_ID=<your-ami-id>  (defaults to ami-085ad6ae776d8f09c)"
     echo "  # optional: export API_ENV_VAR_NAME=<env-var-name> (defaults to 'API_KEY')"
+    echo "  # optional: export INSTANCE_TYPE=<your-instance-type> (defaults to 'm5.xlarge')"
+    echo "  # optional: export VPC_ID=<your-vpc-id> (uses default or creates new if missing)"
     echo "  ./configure_enclave.sh <APP>"
     echo ""
     echo "Options:"
     echo "  -h, --help    Show this help message"
+    echo ""
+    echo ".env support: set KEY_PAIR, REGION, AMI_ID, API_ENV_VAR_NAME, EC2_INSTANCE_NAME, INSTANCE_TYPE, VPC_ID, USE_SECRET, SECRET_CHOICE, USER_SECRET_NAME, SECRET_VALUE, ENCLAVE_APP in .env and they will be auto-loaded."
 }
 
 # Check for help flag
@@ -36,15 +49,18 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     exit 0
 fi
 
-# Check for required APP argument
+load_env_file
+
+# Resolve ENCLAVE_APP from arg/env/default
 if [ -z "$1" ]; then
-    echo "Error: APP argument is required."
-    echo "Usage: ./configure_enclave.sh <APP>"
-    echo "Example: ./configure_enclave.sh twitter-example"
-    echo "Example: ./configure_enclave.sh weather-example"
-    echo ""
-    echo "For more information, run: ./configure_enclave.sh --help"
-    exit 1
+    if [ -n "$ENCLAVE_APP" ]; then
+        echo "Using ENCLAVE_APP from environment: $ENCLAVE_APP"
+    else
+        ENCLAVE_APP="twitter-example"
+        echo "No APP argument provided, defaulting to: $ENCLAVE_APP"
+    fi
+else
+    ENCLAVE_APP="$1"
 fi
 
 ############################
@@ -57,10 +73,11 @@ export AWS_DEFAULT_REGION="$REGION"
 # The default AMI for us-east-1. Change this if your region is different.
 AMI_ID="${AMI_ID:-ami-085ad6ae776d8f09c}"
 
+INSTANCE_TYPE="${INSTANCE_TYPE:-m5.xlarge}"
+
 # Environment variable name for our secret; default is 'API_KEY'
 API_ENV_VAR_NAME="${API_ENV_VAR_NAME:-API_KEY}"
 
-ENCLAVE_APP="${1}"
 ALLOWLIST_PATH="src/nautilus-server/src/apps/${ENCLAVE_APP}/allowed_endpoints.yaml"
 
 ############################
@@ -137,9 +154,12 @@ if [[ "$ENCLAVE_APP" == "seal-example" ]]; then
     USE_SECRET="n"
     IS_SEAL_EXAMPLE=true
 else
-    read -p "Do you want to use a secret? (y/n): " USE_SECRET
+    if [ -z "$USE_SECRET" ]; then
+        read -p "Do you want to use a secret? (y/n): " USE_SECRET
+    else
+        echo "Using preset USE_SECRET value: $USE_SECRET"
+    fi
 
-    # Validate input
     if [[ ! "$USE_SECRET" =~ ^[YyNn]$ ]]; then
         echo "Error: Please enter 'y' or 'n'"
         exit 1
@@ -147,40 +167,77 @@ else
 fi
 
 if [[ "$USE_SECRET" =~ ^[Yy]$ ]]; then
-    read -p "Do you want to create a new secret or use an existing secret ARN? (new/existing): " SECRET_CHOICE
+    if [ -z "$SECRET_CHOICE" ]; then
+        read -p "Do you want to create a new secret or use an existing secret ARN? (new/existing): " SECRET_CHOICE
+    else
+        echo "Using preset SECRET_CHOICE value: $SECRET_CHOICE"
+    fi
 
-    # Validate input
     if [[ ! "$SECRET_CHOICE" =~ ^([Nn]ew|NEW|[Ee]xisting|EXISTING)$ ]]; then
         echo "Error: Please enter 'new' or 'existing'"
         exit 1
     fi
 
     if [[ "$SECRET_CHOICE" =~ ^([Nn]ew|NEW)$ ]]; then
-        #----------------------------------------------------
-        # Create a new secret
-        #----------------------------------------------------
-        read -p "Enter secret name: " USER_SECRET_NAME
+        if [ -z "$USER_SECRET_NAME" ]; then
+            read -p "Enter secret name: " USER_SECRET_NAME
+        else
+            echo "Using preset USER_SECRET_NAME value: $USER_SECRET_NAME"
+        fi
     fi
 fi
 
 # Re-check USE_SECRET after potential seal detection
 if [[ "$USE_SECRET" =~ ^[Yy]$ ]]; then
     if [[ "$SECRET_CHOICE" =~ ^([Nn]ew|NEW)$ ]]; then
-        read -s -p "Enter secret value: " SECRET_VALUE
-        echo ""
+        if [ -z "$SECRET_VALUE" ]; then
+            read -s -p "Enter secret value: " SECRET_VALUE
+            echo ""
+        else
+            echo "Using preset SECRET_VALUE (hidden)"
+        fi
         SECRET_NAME="${USER_SECRET_NAME}"
         echo "Creating secret '$SECRET_NAME' in AWS Secrets Manager..."
-        SECRET_ARN=$(aws secretsmanager create-secret \
+        CREATE_OUTPUT=$(aws secretsmanager create-secret \
           --name "$SECRET_NAME" \
           --secret-string "$SECRET_VALUE" \
           --region "$REGION" \
-          --query 'ARN' --output text)
-        if [ $? -ne 0 ] || [ -z "$SECRET_ARN" ]; then
-            echo "Failed to create secret '$SECRET_NAME'."
-            echo "Make sure AWS credentials are configured, e.g. AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN."
-            exit 1
+          --query 'ARN' --output text 2>&1)
+        CREATE_RC=$?
+        if [ $CREATE_RC -ne 0 ] || [ -z "$CREATE_OUTPUT" ] || [ "$CREATE_OUTPUT" = "None" ]; then
+            echo "Create failed, checking existing secret by name..."
+            EXISTING_ARN=$(aws secretsmanager list-secrets --region "$REGION" \
+              --query "SecretList[?Name=='$USER_SECRET_NAME'].ARN | [0]" --output text)
+            if [ -n "$EXISTING_ARN" ] && [ "$EXISTING_ARN" != "None" ]; then
+                echo "Deleting existing secret $USER_SECRET_NAME ($EXISTING_ARN)..."
+                aws secretsmanager delete-secret --secret-id "$EXISTING_ARN" --force-delete-without-recovery --region "$REGION"
+                for i in {1..10}; do
+                    CHECK=$(aws secretsmanager list-secrets --region "$REGION" \
+                      --query "SecretList[?Name=='$USER_SECRET_NAME'].ARN | [0]" --output text)
+                    if [ -z "$CHECK" ] || [ "$CHECK" = "None" ]; then
+                        break
+                    fi
+                    sleep 2
+                done
+                echo "Re-creating secret '$SECRET_NAME'..."
+                SECRET_ARN=$(aws secretsmanager create-secret \
+                  --name "$SECRET_NAME" \
+                  --secret-string "$SECRET_VALUE" \
+                  --region "$REGION" \
+                  --query 'ARN' --output text)
+                if [ -z "$SECRET_ARN" ] || [ "$SECRET_ARN" = "None" ]; then
+                    echo "Failed to re-create secret. Please ensure credentials and permissions."
+                    exit 1
+                fi
+                echo "Secret created with ARN: $SECRET_ARN"
+            else
+                echo "Secret not found by name; please check AWS permissions or region."
+                read -p "Secret ARN: " SECRET_ARN
+            fi
+        else
+            SECRET_ARN="$CREATE_OUTPUT"
+            echo "Secret created with ARN: $SECRET_ARN"
         fi
-        echo "Secret created with ARN: $SECRET_ARN"
 
         # Create IAM Role, Policy, and Instance Profile for Secret Access
         ROLE_NAME="role-${FINAL_INSTANCE_NAME}"
@@ -577,6 +634,39 @@ rm "$tmp_traffic"
 
 echo "updated run.sh"
 
+# Configure VPC and subnet
+setup_vpc_subnet() {
+  if [ -n "$VPC_ID" ]; then
+    VPC_CHECK=$(aws ec2 describe-vpcs --vpc-ids "$VPC_ID" --region "$REGION" 2>&1)
+    if [ $? -ne 0 ]; then
+      echo "Error: Specified VPC does not exist or is not accessible."
+      echo "$VPC_CHECK"
+      exit 1
+    fi
+  else
+    DEFAULT_VPC=$(aws ec2 describe-vpcs --filter "Name=isDefault,Values=true" --region "$REGION" --query "Vpcs[0].VpcId" --output text)
+    if [ "$DEFAULT_VPC" != "None" ] && [ -n "$DEFAULT_VPC" ]; then
+      VPC_ID=$DEFAULT_VPC
+    else
+      VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --region "$REGION" --query "Vpc.VpcId" --output text)
+      aws ec2 wait vpc-available --vpc-ids "$VPC_ID" --region "$REGION"
+      IGW_ID=$(aws ec2 create-internet-gateway --region "$REGION" --query "InternetGateway.InternetGatewayId" --output text)
+      aws ec2 attach-internet-gateway --vpc-id "$VPC_ID" --internet-gateway-id "$IGW_ID" --region "$REGION"
+    fi
+  fi
+  SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --region "$REGION" --query "Subnets[0].SubnetId" --output text)
+  if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+    AZ=$(aws ec2 describe-availability-zones --region "$REGION" --query "AvailabilityZones[0].ZoneName" --output text)
+    SUBNET_ID=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block 10.0.1.0/24 --availability-zone "$AZ" --region "$REGION" --query "Subnet.SubnetId" --output text)
+    aws ec2 modify-subnet-attribute --subnet-id "$SUBNET_ID" --map-public-ip-on-launch --region "$REGION"
+    ROUTE_TABLE_ID=$(aws ec2 create-route-table --vpc-id "$VPC_ID" --region "$REGION" --query "RouteTable.RouteTableId" --output text)
+    aws ec2 create-route --route-table-id "$ROUTE_TABLE_ID" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID" --region "$REGION"
+    aws ec2 associate-route-table --subnet-id "$SUBNET_ID" --route-table-id "$ROUTE_TABLE_ID" --region "$REGION"
+  fi
+}
+
+setup_vpc_subnet
+
 # Add seal-specific vsock listener for port 3001
 if [ "$IS_SEAL_EXAMPLE" = true ]; then
     echo "Adding seal-specific port 3001 vsock listener to run.sh..."
@@ -601,7 +691,7 @@ SECURITY_GROUP_NAME="instance-script-sg"
 
 SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
   --region "$REGION" \
-  --group-names "$SECURITY_GROUP_NAME" \
+  --filters "Name=group-name,Values=$SECURITY_GROUP_NAME" "Name=vpc-id,Values=$VPC_ID" \
   --query "SecurityGroups[0].GroupId" \
   --output text 2>/dev/null)
 
@@ -610,6 +700,7 @@ if [ "$SECURITY_GROUP_ID" = "None" ] || [ -z "$SECURITY_GROUP_ID" ]; then
   SECURITY_GROUP_ID=$(aws ec2 create-security-group \
     --region "$REGION" \
     --group-name "$SECURITY_GROUP_NAME" \
+    --vpc-id "$VPC_ID" \
     --description "Security group allowing SSH (22), HTTPS (443), and port 3000" \
     --query "GroupId" --output text)
 
@@ -632,26 +723,48 @@ else
 fi
 
 ############################
-# Launch EC2
+# Launch EC2 or use existing instance
 ############################
-echo "Launching EC2 instance with Nitro Enclaves enabled..."
 
-INSTANCE_ID=$(aws ec2 run-instances \
-  --region "$REGION" \
-  --image-id "$AMI_ID" \
-  --instance-type m5.xlarge \
-  --key-name "$KEY_PAIR" \
-  --user-data file://user-data.sh \
-  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200}}]' \
-  --enclave-options Enabled=true \
-  --security-group-ids "$SECURITY_GROUP_ID" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${FINAL_INSTANCE_NAME}},{Key=instance-script,Value=true}]" \
-  --query "Instances[0].InstanceId" --output text)
-
-echo "Instance launched with ID: $INSTANCE_ID"
-
-echo "Waiting for instance $INSTANCE_ID to run..."
-aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+if [ -n "$INSTANCE_ID" ]; then
+  INSTANCE_CHECK=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" 2>&1)
+  if [ $? -ne 0 ]; then
+    echo "Error: Specified instance does not exist or is not accessible."
+    echo "$INSTANCE_CHECK"
+    exit 1
+  fi
+  ENCLAVE_SUPPORT=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --query "Reservations[0].Instances[0].EnclaveOptions.Enabled" --output text)
+  if [ "$ENCLAVE_SUPPORT" != "True" ] && [ "$ENCLAVE_SUPPORT" != "true" ]; then
+    read -p "The specified instance may not have Nitro Enclaves enabled. Continue? (y/n): " CONTINUE_WITH_INSTANCE
+    if [[ ! "$CONTINUE_WITH_INSTANCE" =~ ^[Yy]$ ]]; then
+      exit 1
+    fi
+  fi
+  INSTANCE_NAME=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --query "Reservations[0].Instances[0].Tags[?Key=='Name'].Value" --output text)
+  if [ -z "$INSTANCE_NAME" ]; then
+    INSTANCE_NAME="$FINAL_INSTANCE_NAME"
+    aws ec2 create-tags --resources "$INSTANCE_ID" --tags "Key=Name,Value=$INSTANCE_NAME" "Key=instance-script,Value=true" --region "$REGION"
+  fi
+  PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+  cat user-data.sh > setup_existing_instance.sh
+  chmod +x setup_existing_instance.sh
+else
+  echo "Launching EC2 instance with Nitro Enclaves enabled..."
+  INSTANCE_ID=$(aws ec2 run-instances \
+    --region "$REGION" \
+    --image-id "$AMI_ID" \
+    --instance-type "$INSTANCE_TYPE" \
+    --key-name "$KEY_PAIR" \
+    --user-data file://user-data.sh \
+    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200}}]' \
+    --enclave-options Enabled=true \
+    --security-group-ids "$SECURITY_GROUP_ID" \
+    --subnet-id "$SUBNET_ID" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${FINAL_INSTANCE_NAME}},{Key=instance-script,Value=true}]" \
+    --query "Instances[0].InstanceId" --output text)
+  aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+  PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+fi
 
 # If an IAM role was created, associate its instance profile with the instance.
 if [ -n "$ROLE_NAME" ]; then
@@ -683,3 +796,15 @@ echo "[*] ssh inside the launched EC2 instance. e.g. \`ssh ec2-user@\"$PUBLIC_IP
 echo "[*] Clone or copy the repo with the above generated code."
 echo "[*] Inside repo directory: 'make run ENCLAVE_APP=<APP>'"
 echo "[*] Run expose_enclave.sh from within the EC2 instance to expose the enclave to the internet."
+
+echo
+echo "==== Next Steps (auto-generated) ===="
+echo "Public IP: $PUBLIC_IP"
+echo "Sync code:"
+echo "  rsync -av --exclude-from=.scpignore --delete --delete-excluded -e \"ssh -i ~/.ssh/${KEY_PAIR}.pem\" ./ ec2-user@$PUBLIC_IP:~/nautilus/"
+echo "On EC2:"
+echo "  ssh -i ~/.ssh/${KEY_PAIR}.pem ec2-user@$PUBLIC_IP"
+echo "  cd ~/nautilus && make stop && make ENCLAVE_APP=$ENCLAVE_APP && make run && sh expose_enclave.sh"
+echo "Verify:"
+echo "  curl -H 'Content-Type: application/json' -X GET http://$PUBLIC_IP:3000/health_check"
+echo "  curl -H 'Content-Type: application/json' -X GET http://$PUBLIC_IP:3000/get_attestation"

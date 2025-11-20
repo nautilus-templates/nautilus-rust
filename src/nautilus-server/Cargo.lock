@@ -1686,6 +1686,7 @@ dependencies = [
  "bcs",
  "fastcrypto",
  "lazy_static",
+ "libc",
  "rand",
  "regex",
  "reqwest",

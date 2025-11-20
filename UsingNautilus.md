@@ -362,3 +362,87 @@ sha256sum root.pem
 ```
 
 [Back to table of contents](#table-of-contents)
+
+## AWS Nitro Enclaves Deployment
+
+This section integrates the AWS Nitro Enclaves deployment guide and provides a streamlined path to run the enclave on AWS EC2 with Nitro Enclaves, exposing `3000` and `9184` ports and enabling attestation and metrics.
+
+### Overview
+- Goal: Deploy the Nautilus template on AWS EC2 + Nitro Enclaves and expose `3000`/`9184`.
+- Endpoints: `health_check`, `get_attestation`, `process_data` available; metrics on `9184`.
+- Reproducibility: PCRs reproducible via `out/nitro.pcrs`.
+
+### Prerequisites
+- macOS: `brew install awscli jq yq`
+- Linux: `sudo apt-get/dnf install -y awscli jq yq`
+- AWS CLI: `aws configure` (or set `AWS_PROFILE`, and include `AWS_SESSION_TOKEN` if using temporary credentials)
+- SSH key: ensure `.pem` permissions `chmod 600 ~/.ssh/<your>.pem`
+
+### AWS Region and AMI
+- Default `REGION=us-east-1`
+- Default `AMI_ID=ami-085ad6ae776d8f09c` (Amazon Linux 2023)
+- Key Pair name: `aws ec2 describe-key-pairs --region <REGION>` → `export KEY_PAIR=<your-keypair>`
+- Public IP: `aws ec2 describe-instances --region <REGION> --query "Reservations[*].Instances[*].[PublicIpAddress]" --output table`
+
+### Configure locally
+```sh
+cd <Template Root Path>
+export KEY_PAIR=<your-keypair>
+export REGION=us-east-1
+# optional: export AMI_ID=ami-085ad6ae776d8f09c
+sh configure_enclave.sh
+```
+- The script will:
+  - Reuse/create VPC, subnet, security group
+  - Generate and update `expose_enclave.sh` and `src/nautilus-server/run.sh`
+  - Enable `vsock-proxy` on the parent EC2 instance
+  - Output `InstanceId` and `PUBLIC_IP`
+- Commit generated files:
+```sh
+git add expose_enclave.sh src/nautilus-server/run.sh && git commit -m "Configure enclave"
+```
+
+### Build and run on EC2
+```sh
+rsync -av --exclude-from=.scpignore --delete --delete-excluded -e "ssh -i ~/.ssh/<your>.pem" ./ ec2-user@<PUBLIC_IP>:~/nautilus/
+ssh -i ~/.ssh/<your>.pem ec2-user@<PUBLIC_IP>
+cd ~/nautilus
+make && make run       # debug: make run-debug (PCRs all zeros)
+sh expose_enclave.sh   # expose 3000/9184 and inject secrets
+```
+
+### Verification
+```sh
+nitro-cli describe-enclaves
+curl -H 'Content-Type: application/json' -X GET http://<PUBLIC_IP>:3000/health_check
+curl -H 'Content-Type: application/json' -X GET http://<PUBLIC_IP>:3000/get_attestation
+curl -H 'Content-Type: application/json' -d '{"payload":{"user_url":"https://x.com/.../status/..."}}' -X POST http://<PUBLIC_IP>:3000/process_data
+```
+
+### Reproduce PCRs
+```sh
+cd ~/nautilus && make && cat out/nitro.pcrs
+```
+
+### Troubleshooting
+- SSH failure (Connection reset): open inbound `22`; ensure `chmod 600` on key; username `ec2-user`; confirm instance `running` and public IP.
+- `health_check` domain false:
+  - Parent proxy: `sudo pgrep -a vsock-proxy`; if not running: `sudo nohup vsock-proxy 8101 api.twitter.com 443 >/var/log/vsock-proxy-8101.log 2>&1 &`
+  - Parent internet: from EC2 test `nc -vz api.twitter.com 443`
+- Ports unreachable: open inbound `3000/9184` and run `sh expose_enclave.sh`.
+- Reset:
+```sh
+cd ~/nautilus && sh reset_enclave.sh && make && make run && sh expose_enclave.sh
+```
+
+### Terminate instance
+```sh
+aws ec2 describe-instances --region us-east-1 --query "Reservations[*].Instances[*].[InstanceId,State.Name,Tags]"
+aws ec2 terminate-instances --instance-ids <INSTANCE_ID> --region us-east-1
+```
+
+### Environment variables
+- `KEY_PAIR`: AWS Key Pair name (e.g., `aws-ec2-tee-keypair`)
+- `REGION`: defaults to `us-east-1`
+- `AMI_ID`: defaults to `ami-085ad6ae776d8f09c`
+- `API_ENV_VAR_NAME`: defaults to `API_KEY` (injected into enclave)
